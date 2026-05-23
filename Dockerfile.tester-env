@@ -1,0 +1,48 @@
+# Multi-stage Dockerfile for Trilium — builds from editable source then produces
+# a minimal runtime image. Context must be the repo root.
+#
+# Build:  docker build -f Dockerfile.tester-env -t tester-env-trilium .
+# Run:    docker run --rm -p 38080:8080 -e TRILIUM_GENERAL_NOAUTHENTICATION=true tester-env-trilium
+# Reset:  docker stop <container> && docker rm <container> && docker volume rm trilium-data
+
+FROM node:24.15.0-bullseye-slim AS builder
+
+RUN corepack enable
+
+# Build tools required for native addon compilation (better-sqlite3)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        make \
+        g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+
+# Copy workspace config first for better layer caching (optional, full copy works)
+COPY . .
+
+# Install all workspace dependencies — postinstall will run electron-rebuild
+# which is harmless (may emit warnings but exits 0 for server-only builds)
+RUN pnpm install --no-frozen-lockfile
+
+# Build the server (output → apps/server/dist/)
+RUN pnpm run server:build
+
+
+FROM node:24.15.0-bullseye-slim
+
+WORKDIR /usr/src/app
+
+# Copy built server from builder stage
+COPY --from=builder /usr/src/app/apps/server/dist/ .
+
+# The healthcheck is bundled into dist/ as docker_healthcheck.cjs
+# No need for start-docker.sh user-switching — we run as root for development
+
+# Data directory — mount a volume here for persistence
+ENV TRILIUM_DATA_DIR=/home/node/trilium-data
+RUN mkdir -p /home/node/trilium-data
+
+EXPOSE 8080
+CMD ["node", "main.cjs"]

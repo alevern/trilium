@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Trilium - Tester Environment CLI
+# Usage: ./tester-env <command> [--port <port>] [--run-id <id>]
+# Commands: deploy, reset, stop, logs, status, seed, verify, help
+
+RUN_ID="default"
+PORT="38080"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    CONTAINER_NAME="tester-env-trilium${suffix}"
+    IMAGE_NAME="tester-env-trilium${suffix}"
+    DATA_VOLUME="trilium-data${suffix}"
+}
+
+###############################################################################
+# ETAPI helper — deterministic note creation via Trilium's External API
+# All noteIds are explicitly set, and all dates are fixed so the seed is
+# fully reproducible across resets.
+###############################################################################
+
+API_BASE="http://localhost:${PORT}/etapi"
+FIXED_UTC="2024-06-15 10:00:00.000Z"
+FIXED_LOCAL="2024-06-15 11:00:00.000+0100"
+
+etapi_create() {
+    # Usage: etapi_create <noteId> <parentNoteId> <title> <type> <content> [mime] [notePosition] [prefix]
+    local noteId="$1" parentNoteId="$2" title="$3" type="$4" content="$5"
+    local mime="${6:-text/html}"
+    local notePosition="${7:-10}"
+    local prefix="${8:-}"
+
+    local body
+    body=$(jq -n \
+        --arg noteId "$noteId" \
+        --arg parent "$parentNoteId" \
+        --arg title "$title" \
+        --arg type "$type" \
+        --arg mime "$mime" \
+        --arg content "$content" \
+        --arg pos "$notePosition" \
+        --arg dc "$FIXED_LOCAL" \
+        --arg udc "$FIXED_UTC" \
+        '{
+            noteId: $noteId,
+            parentNoteId: $parent,
+            title: $title,
+            type: $type,
+            mime: $mime,
+            content: $content,
+            notePosition: ($pos | tonumber),
+            dateCreated: $dc,
+            utcDateCreated: $udc
+        }')
+
+    local resp
+    resp=$(curl -s -X POST "${API_BASE}/create-note" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    local createdId
+    createdId=$(echo "$resp" | jq -r '.note.noteId // empty')
+    if [[ "$createdId" != "$noteId" ]]; then
+        echo "ERROR: Failed to create note ${noteId}, got: ${resp}" >&2
+        return 1
+    fi
+    echo "  + ${noteId}: ${title} (type=${type})"
+}
+
+etapi_set_content() {
+    local noteId="$1" content="$2"
+    curl -s -o /dev/null -X PUT "${API_BASE}/notes/${noteId}/content" \
+        -H "Content-Type: text/plain" \
+        -d "$content"
+}
+
+etapi_add_label() {
+    # Usage: etapi_add_label <noteId> <name> <value> [isInheritable]
+    local noteId="$1" name="$2" value="$3"
+    local inheritable="${4:-false}"
+    local resp
+    resp=$(curl -s -X POST "${API_BASE}/attributes" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg nid "$noteId" --arg name "$name" --arg val "$value" --arg inh "$inheritable" '{
+            noteId: $nid,
+            type: "label",
+            name: $name,
+            value: $val,
+            isInheritable: ($inh == "true")
+        }')")
+    local aid
+    aid=$(echo "$resp" | jq -r '.attributeId // empty')
+    if [[ -z "$aid" ]]; then
+        echo "WARN: Failed to add label ${name}=${value} to ${noteId}: ${resp}" >&2
+    fi
+}
+
+###############################################################################
+# cmd_seed — deterministic seed data using ETAPI with fixed noteIds
+# Creates an ACME Corp knowledge base with 24 notes across 6 sections.
+###############################################################################
+
+cmd_seed() {
+    echo "==> Seeding Trilium with ACME Corp knowledge base..."
+
+    # ── Root-level: ACME Corp Knowledge Base (book) ──
+    etapi_create "acmeRoot" "root" "ACME Corp Knowledge Base" "book" "" "text/html" 5
+
+    # ═══ Section 1: Getting Started ═══
+    etapi_create "sectGettingStarted" "acmeRoot" "Getting Started" "book" "" "text/html" 10
+    etapi_create "noteWelcome" "sectGettingStarted" "Welcome to ACME Corp" "text" \
+        '<h2>Welcome to ACME Corporation</h2>
+<p>Founded in 2018, ACME Corp delivers enterprise software solutions to Fortune 500 companies. Our mission is to simplify complex workflows through intuitive design and robust engineering.</p>
+<p>This knowledge base serves as the central repository for all company documentation, project plans, meeting notes, and technical references.</p>
+<h3>Quick Links</h3>
+<ul><li>Project Planning → Q2 Roadmap</li><li>HR &amp; Admin → Benefits Overview</li><li>Technical Docs → API Reference</li></ul>' \
+        "text/html" 10
+    etapi_add_label "noteWelcome" "iconClass" "bx bx-home-alt"
+
+    etapi_create "noteCodeOfConduct" "sectGettingStarted" "Code of Conduct" "text" \
+        '<h2>Code of Conduct</h2>
+<p>ACME Corp is committed to providing a harassment-free experience for everyone. We expect all employees to:</p>
+<ul><li>Be respectful and inclusive</li><li>Communicate openly and constructively</li><li>Take responsibility for their actions</li><li>Report violations promptly to HR</li></ul>
+<p><strong>Last updated:</strong> March 2024</p>' \
+        "text/html" 20
+
+    etapi_create "noteITOnboarding" "sectGettingStarted" "IT Onboarding Checklist" "text" \
+        '<h2>IT Onboarding Checklist for New Hires</h2>
+<ol><li>Set up company email account (GSuite)</li><li>Join Slack workspace #general, #engineering, #random</li><li>Install VPN client from <code>vpn.acmecorp.com</code></li><li>Clone repositories from GitHub organization</li><li>Set up local dev environment per <em>Engineering Standards → Setup</em></li><li>Schedule 1:1 with manager (first week)</li></ol>
+<p><strong>IT Support:</strong> helpdesk@acmecorp.com | Slack #it-help</p>' \
+        "text/html" 30
+    etapi_add_label "noteITOnboarding" "priority" "high"
+    etapi_add_label "noteITOnboarding" "department" "IT"
+    etapi_add_label "noteITOnboarding" "audience" "new-hires"
+
+    # ═══ Section 2: Project Planning ═══
+    etapi_create "sectProjectPlanning" "acmeRoot" "Project Planning" "book" "" "text/html" 20
+    etapi_add_label "sectProjectPlanning" "iconClass" "bx bx-calendar"
+
+    etapi_create "noteQ2Roadmap" "sectProjectPlanning" "Q2 Roadmap 2024" "text" \
+        '<h2>Q2 2024 Product Roadmap</h2>
+<table><tr><th>Initiative</th><th>Owner</th><th>Target</th><th>Status</th></tr>
+<tr><td>Dashboard v2 Redesign</td><td>Alice Chen</td><td>Apr 30</td><td>In Progress</td></tr>
+<tr><td>API Rate Limiting</td><td>Bob Martinez</td><td>May 15</td><td>Planning</td></tr>
+<tr><td>SSO Integration</td><td>Carol Wu</td><td>Jun 30</td><td>Not Started</td></tr>
+<tr><td>Mobile App Beta</td><td>Dave Kim</td><td>Jun 15</td><td>In Progress</td></tr></table>
+<p><strong>Key Risk:</strong> SSO integration depends on third-party vendor timeline.</p>' \
+        "text/html" 10
+
+    # Migration Project (book with children)
+    etapi_create "noteMigrationProject" "sectProjectPlanning" "Migration Project" "book" "" "text/html" 20
+
+    etapi_create "noteMigrationPlan" "noteMigrationProject" "Migration Plan" "text" \
+        '<h2>Legacy System Migration Plan</h2>
+<p><strong>Scope:</strong> Migrate ACME CRM from on-premise MySQL to cloud-hosted PostgreSQL on AWS RDS.</p>
+<h3>Phases</h3>
+<ol><li>Schema analysis and compatibility check — <em>Week 1-2</em></li><li>Data export and transformation scripts — <em>Week 3-4</em></li><li>Staging environment validation — <em>Week 5</em></li><li>Production cutover (scheduled downtime) — <em>Week 6</em></li><li>Post-migration monitoring — <em>Week 7-8</em></li></ol>
+<p><strong>Downtime Window:</strong> Saturday July 20, 02:00-06:00 UTC</p>' \
+        "text/html" 10
+
+    etapi_create "noteLegacyInventory" "noteMigrationProject" "Legacy Server Inventory" "text" \
+        '<h2>Legacy Server Inventory</h2>
+<table><tr><th>Hostname</th><th>IP</th><th>OS</th><th>MySQL Version</th><th>DB Size</th></tr>
+<tr><td>crm-db-01</td><td>10.0.1.15</td><td>Ubuntu 20.04</td><td>8.0.32</td><td>450 GB</td></tr>
+<tr><td>crm-db-02 (replica)</td><td>10.0.1.16</td><td>Ubuntu 20.04</td><td>8.0.32</td><td>450 GB</td></tr>
+<tr><td>crm-app-01</td><td>10.0.2.10</td><td>CentOS 7</td><td>—</td><td>—</td></tr>
+<tr><td>crm-app-02</td><td>10.0.2.11</td><td>CentOS 7</td><td>—</td><td>—</td></tr></table>' \
+        "text/html" 20
+
+    etapi_create "noteRollbackProc" "noteMigrationProject" "Rollback Procedure" "code" \
+        '#!/bin/bash
+# Rollback CRM migration to legacy MySQL
+# Usage: ./rollback-crm.sh [--dry-run]
+
+set -e
+
+LEGACY_HOST="10.0.1.15"
+RDS_ENDPOINT="crm-prod.xyz.us-east-1.rds.amazonaws.com"
+
+echo "==> Stopping application servers..."
+ssh crm-app-01 "sudo systemctl stop crm-api"
+ssh crm-app-02 "sudo systemctl stop crm-api"
+
+echo "==> Restoring DNS to legacy host..."
+# TTL was pre-lowered to 60s
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z123456 \
+  --change-batch file://dns-rollback.json
+
+echo "==> Starting application servers against legacy DB..."
+ssh crm-app-01 "sudo systemctl start crm-api"
+ssh crm-app-02 "sudo systemctl start crm-api"
+
+echo "==> Rollback complete. Monitor for 30 minutes."' \
+        "text/x-sh" 30
+
+    etapi_create "noteBudgetReview" "sectProjectPlanning" "Budget Review 2024" "text" \
+        '<h2>Engineering Budget Review — FY2024</h2>
+<table><tr><th>Category</th><th>Q1 Actual</th><th>Q2 Forecast</th><th>Q3 Plan</th><th>Q4 Plan</th></tr>
+<tr><td>Cloud Infrastructure</td><td>$48,200</td><td>$52,000</td><td>$55,000</td><td>$58,000</td></tr>
+<tr><td>SaaS Tools</td><td>$12,500</td><td>$12,500</td><td>$12,500</td><td>$12,500</td></tr>
+<tr><td>Training</td><td>$5,000</td><td>$8,000</td><td>$3,000</td><td>$4,000</td></tr>
+<tr><td>Contractors</td><td>$22,000</td><td>$20,000</td><td>$15,000</td><td>$10,000</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>$87,700</strong></td><td><strong>$92,500</strong></td><td><strong>$85,500</strong></td><td><strong>$84,500</strong></td></tr></table>
+<p><strong>Notes:</strong> Cloud costs rising due to increased traffic. Contractor spend decreasing as we hire FTE positions.</p>' \
+        "text/html" 30
+    etapi_add_label "noteBudgetReview" "status" "reviewed"
+
+    # ═══ Section 3: Meeting Notes ═══
+    etapi_create "sectMeetingNotes" "acmeRoot" "Meeting Notes" "book" "" "text/html" 30
+
+    etapi_create "noteSprintPlanning" "sectMeetingNotes" "Sprint Planning — Jan 15, 2024" "text" \
+        '<h2>Sprint Planning Notes</h2>
+<p><strong>Date:</strong> January 15, 2024 | <strong>Attendees:</strong> Alice, Bob, Carol, Dave, Eve</p>
+<h3>Sprint Goal</h3>
+<p>Deliver user-facing dashboard with real-time metrics and configurable widgets.</p>
+<h3>Stories Committed</h3>
+<ul><li>DASH-101: Dashboard layout engine (8 pts) — Alice</li><li>DASH-102: Real-time WebSocket data feed (5 pts) — Bob</li><li>DASH-103: Widget configuration panel (5 pts) — Carol</li><li>DASH-104: Chart rendering library integration (3 pts) — Dave</li><li>DASH-105: E2E tests for dashboard (3 pts) — Eve</li></ul>
+<p><strong>Capacity:</strong> 24 pts (5 developers) | <strong>Committed:</strong> 24 pts</p>
+<p><strong>Risks:</strong> WebSocket library upgrade may introduce breaking changes.</p>' \
+        "text/html" 10
+
+    etapi_create "noteQ2Retro" "sectMeetingNotes" "Q2 Retrospective — July 2024" "text" \
+        '<h2>Q2 Retrospective — July 10, 2024</h2>
+<p><strong>Facilitator:</strong> Eve Thompson | <strong>Attendees:</strong> Full engineering team (8 people)</p>
+<h3>What Went Well 🌟</h3>
+<ul><li>Dashboard v2 shipped on schedule with zero critical bugs</li><li>New CI/CD pipeline reduced deploy time from 45min to 12min</li><li>API Rate Limiting deployed without customer-facing downtime</li></ul>
+<h3>What Could Be Improved 📝</h3>
+<ul><li>Sprint planning estimates were off by 30% on average — need better story pointing</li><li>Code review turnaround time averaged 1.8 days (target: < 1 day)</li><li>Documentation updates lagged behind feature releases</li></ul>
+<h3>Action Items</h3>
+<ol><li><strong>Alice:</strong> Propose revised estimation guidelines by Jul 20</li><li><strong>Bob:</strong> Set up automated review assignment rotation in GitHub</li><li><strong>Carol:</strong> Add documentation checklist to PR template</li></ol>
+<p>This is the <strong>Q2 Retrospective</strong> document. Search for "Q2 Retrospective" to find this exact note.</p>' \
+        "text/html" 20
+    etapi_add_label "noteQ2Retro" "type" "retrospective"
+    etapi_add_label "noteQ2Retro" "quarter" "Q2"
+    etapi_add_label "noteQ2Retro" "year" "2024"
+
+    etapi_create "noteAllHands" "sectMeetingNotes" "All Hands — March 2024" "text" \
+        '<h2>Company All Hands — March 20, 2024</h2>
+<p><strong>Presenter:</strong> Jane Smith (CEO)</p>
+<h3>Company Updates</h3>
+<ul><li>Revenue grew 42% YoY in Q1 — exceeded targets</li><li>Customer NPS score improved from 72 to 78</li><li>Hired 12 new team members across engineering (5), sales (4), and support (3)</li></ul>
+<h3>Product Vision</h3>
+<p>By end of 2024, ACME will launch an AI-powered analytics module that automatically surfaces insights from customer data. This is our biggest bet for the year.</p>
+<h3>Q&A Highlights</h3>
+<ul><li><em>Q: Will we return to office?</em> — A: Hybrid policy remains; 2 days/week in office strongly encouraged.</li><li><em>Q: Stock options refresh?</em> — A: Annual refresh coming in April for eligible employees.</li></ul>' \
+        "text/html" 30
+
+    # ═══ Section 4: Technical Documentation ═══
+    etapi_create "sectTechnicalDocs" "acmeRoot" "Technical Documentation" "book" "" "text/html" 40
+    etapi_add_label "sectTechnicalDocs" "iconClass" "bx bx-code-alt"
+
+    # API Reference (book with children)
+    etapi_create "noteAPIRef" "sectTechnicalDocs" "API Reference" "book" "" "text/html" 10
+
+    etapi_create "noteAuthEndpoints" "noteAPIRef" "Authentication Endpoints" "code" \
+        'POST /api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "********"
+}
+
+Response 200:
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "expires_at": "2024-06-15T12:00:00Z",
+  "refresh_token": "dGhpcyBpcyBh..."
+}
+
+---
+
+POST /api/v1/auth/refresh
+Authorization: Bearer <refresh_token>
+
+Response 200:
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "expires_at": "2024-06-15T13:00:00Z"
+}
+
+---
+POST /api/v1/auth/logout
+Authorization: Bearer <token>
+
+Response 204: (no body)' \
+        "application/json" 10
+
+    etapi_create "noteUserEndpoints" "noteAPIRef" "User Endpoints" "code" \
+        'GET /api/v1/users?page=1&limit=20
+Authorization: Bearer <token>
+
+Response 200:
+{
+  "data": [
+    {"id": "usr_001", "name": "Alice Chen", "role": "admin"},
+    {"id": "usr_002", "name": "Bob Martinez", "role": "developer"}
+  ],
+  "pagination": {"page": 1, "limit": 20, "total": 47}
+}
+
+---
+POST /api/v1/users
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "name": "New User",
+  "email": "newuser@acmecorp.com",
+  "role": "developer"
+}
+
+Response 201:
+{
+  "id": "usr_048",
+  "name": "New User",
+  "email": "newuser@acmecorp.com",
+  "role": "developer",
+  "created_at": "2024-06-15T10:00:00Z"
+}' \
+        "application/json" 20
+
+    etapi_create "noteDBSchema" "sectTechnicalDocs" "Database Schema" "code" \
+        '-- ACME CRM Core Schema (PostgreSQL)
+-- Migrated from legacy MySQL 8.0
+
+CREATE TABLE organizations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    industry VARCHAR(100),
+    plan_tier VARCHAR(20) CHECK (plan_tier IN ("free", "starter", "pro", "enterprise")),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT "member",
+    last_login_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_org ON users(org_id);
+CREATE INDEX idx_users_email ON users(email);
+
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key_hash VARCHAR(255) NOT NULL,
+    name VARCHAR(100),
+    last_used_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);' \
+        "text/x-sql" 20
+
+    etapi_create "noteDeployRunbook" "sectTechnicalDocs" "Deployment Runbook" "code" \
+        '#!/bin/bash
+# ACME CRM Production Deployment Runbook
+# Triggered by CI/CD pipeline on merge to main
+set -euo pipefail
+
+APP="acme-crm"
+ENV="${1:-staging}"
+REGION="us-east-1"
+CLUSTER="acme-${ENV}"
+
+echo "==> Starting deployment of ${APP} to ${ENV} (${REGION})"
+
+# 1. Build and push Docker image
+echo "==> Building Docker image..."
+docker build -t "${APP}:${GITHUB_SHA}" .
+docker tag "${APP}:${GITHUB_SHA}" "${ECR_REPO}:${GITHUB_SHA}"
+docker push "${ECR_REPO}:${GITHUB_SHA}"
+
+# 2. Run database migrations
+echo "==> Running database migrations..."
+aws ecs run-task \
+  --cluster "${CLUSTER}" \
+  --task-definition "${APP}-migrate" \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[${SUBNET_IDS}]}"
+
+# 3. Deploy new task definition
+echo "==> Updating ECS service..."
+aws ecs update-service \
+  --cluster "${CLUSTER}" \
+  --service "${APP}" \
+  --force-new-deployment
+
+# 4. Wait for deployment to stabilize
+echo "==> Waiting for deployment to stabilize..."
+aws ecs wait services-stable \
+  --cluster "${CLUSTER}" \
+  --services "${APP}"
+
+echo "==> Deployment complete! Health check URL: https://${APP}.${ENV}.acmecorp.com/health"' \
+        "text/x-sh" 30
+    etapi_add_label "noteDeployRunbook" "environment" "production"
+
+    # Architecture Overview (text with children)
+    etapi_create "noteArchOverview" "sectTechnicalDocs" "Architecture Overview" "text" \
+        '<h2>ACME CRM Architecture Overview</h2>
+<p>The ACME CRM platform follows a microservices architecture with a React SPA frontend, Node.js API gateway, and PostgreSQL primary data store.</p>
+<h3>High-Level Components</h3>
+<ul><li><strong>Frontend:</strong> React 18 + TypeScript, served via CloudFront CDN</li><li><strong>API Gateway:</strong> Node.js (Express) handling authentication, routing, rate limiting</li><li><strong>Microservices:</strong> Go-based services for billing, notifications, analytics</li><li><strong>Database:</strong> PostgreSQL 15 on RDS with read replicas</li><li><strong>Cache:</strong> Redis 7 for session storage and query caching</li><li><strong>Message Queue:</strong> RabbitMQ for async inter-service communication</li></ul>
+<p>See child notes for detailed component breakdowns.</p>' \
+        "text/html" 10
+
+    etapi_create "noteSysComponents" "noteArchOverview" "System Components" "text" \
+        '<h2>System Components — Detailed Breakdown</h2>
+<h3>API Gateway (api-gateway)</h3>
+<ul><li>Language: Node.js 20 + Express</li><li>Responsibilities: Auth, routing, rate limiting, request validation</li><li>Port: 3000</li><li>Health: GET /health</li></ul>
+<h3>Billing Service (billing-svc)</h3>
+<ul><li>Language: Go 1.22</li><li>Responsibilities: Invoice generation, payment processing (Stripe), plan management</li><li>Port: 4001</li><li>DB: Owns <code>billing</code> schema in PostgreSQL</li></ul>
+<h3>Notification Service (notify-svc)</h3>
+<ul><li>Language: Go 1.22</li><li>Responsibilities: Email (SendGrid), Slack notifications, in-app alerts</li><li>Port: 4002</li><li>Consumes: RabbitMQ <code>notifications</code> queue</li></ul>' \
+        "text/html" 10
+
+    etapi_create "noteDataFlow" "noteArchOverview" "Data Flow Diagram" "text" \
+        '<h2>Data Flow — User Request Lifecycle</h2>
+<ol><li>User navigates to <code>app.acmecorp.com</code> → CloudFront serves React SPA</li><li>User logs in → POST /api/v1/auth/login → API Gateway validates credentials against <code>users</code> table</li><li>API Gateway returns JWT → Frontend stores in memory</li><li>User views dashboard → GET /api/v1/dashboard → API Gateway validates JWT → forwards to Analytics Service</li><li>Analytics Service queries PostgreSQL read replica → returns aggregated metrics</li><li>User creates invoice → POST /api/v1/invoices → API Gateway → Billing Service → writes to <code>billing.invoices</code> table → publishes event to RabbitMQ</li><li>Notification Service consumes event → sends email confirmation via SendGrid</li></ol>' \
+        "text/html" 20
+
+    # ═══ Section 5: Engineering Standards ═══
+    etapi_create "sectEngStandards" "acmeRoot" "Engineering Standards" "book" "" "text/html" 50
+
+    etapi_create "noteCodeReview" "sectEngStandards" "Code Review Guidelines" "text" \
+        '<h2>Code Review Guidelines</h2>
+<p>Every pull request must be reviewed by at least one team member before merging. Reviews should focus on:</p>
+<ol><li><strong>Correctness:</strong> Does the code do what it claims to do?</li><li><strong>Security:</strong> Are inputs validated? Are secrets exposed?</li><li><strong>Performance:</strong> Are there N+1 queries? Unbounded memory usage?</li><li><strong>Maintainability:</strong> Is the code readable? Are edge cases handled?</li><li><strong>Testing:</strong> Are there meaningful tests covering the change?</li></ol>
+<h3>Review SLAs</h3>
+<ul><li>P0 (critical bug fix): Review within 2 hours</li><li>P1 (feature, normal priority): Review within 1 business day</li><li>P2 (refactor, minor change): Review within 2 business days</li></ul>
+<p><strong>Pro tip:</strong> Keep PRs under 400 lines for faster, higher-quality reviews.</p>' \
+        "text/html" 10
+
+    etapi_create "noteGitWorkflow" "sectEngStandards" "Git Workflow" "text" \
+        '<h2>Git Branching Strategy</h2>
+<p>We use a modified trunk-based development workflow:</p>
+<h3>Branches</h3>
+<ul><li><code>main</code> — Always deployable. All merges must pass CI.</li><li><code>feature/*</code> — Short-lived feature branches. Merged within 1-2 days.</li><li><code>fix/*</code> — Bug fix branches. May be hotfixes merged directly to main.</li><li><code>release/*</code> — Release stabilization branches. Only cherry-picks from main.</li></ul>
+<h3>Commit Message Format</h3>
+<pre>type(scope): short description
+
+[optional body with details]
+
+[optional footer with ticket references]
+</pre>
+<p>Types: feat, fix, refactor, test, docs, chore<br>Example: <code>feat(dashboard): add real-time metric cards</code></p>' \
+        "text/html" 20
+
+    etapi_create "noteTestingStrategy" "sectEngStandards" "Testing Strategy" "text" \
+        '<h2>QA and Testing Strategy</h2>
+<h3>Test Pyramid</h3>
+<ul><li><strong>Unit Tests (70%):</strong> Jest for frontend, Go testing for backend. Run on every commit.</li><li><strong>Integration Tests (20%):</strong> API contract tests with supertest. Run on every PR.</li><li><strong>E2E Tests (10%):</strong> Playwright for critical user journeys. Run on merge to main.</li></ul>
+<h3>Coverage Targets</h3>
+<ul><li>New code: 80% line coverage minimum</li><li>Critical paths (auth, billing): 95% branch coverage</li></ul>
+<h3>QA Environment</h3>
+<p>Staging environment auto-deploys from main branch. Manual QA happens here before production releases.</p>' \
+        "text/html" 30
+
+    # ═══ Section 6: HR & Admin ═══
+    etapi_create "sectHRAdmin" "acmeRoot" "HR & Admin" "book" "" "text/html" 60
+
+    etapi_create "noteBenefits" "sectHRAdmin" "Benefits Overview" "text" \
+        '<h2>ACME Corp Employee Benefits — 2024</h2>
+<h3>Health & Wellness</h3>
+<ul><li>Medical: BlueCross PPO (80% employer covered) or HDHP with HSA</li><li>Dental & Vision: Fully covered</li><li>Mental Health: 12 free therapy sessions/year via Spring Health</li><li>Gym Reimbursement: Up to $50/month</li></ul>
+<h3>Time Off</h3>
+<ul><li>PTO: 20 days/year (accrues monthly)</li><li>Sick Leave: Unlimited (manager approval after 3 consecutive days)</li><li>Holidays: 12 company holidays (see Holiday Schedule)</li><li>Parental Leave: 16 weeks fully paid</li></ul>
+<h3>Financial</h3>
+<ul><li>401(k): 4% company match, immediate vesting</li><li>Stock Options: ISO grants with 4-year vest (1-year cliff)</li><li>Annual Bonus: Up to 10% based on company + individual performance</li></ul>' \
+        "text/html" 10
+    etapi_add_label "noteBenefits" "iconClass" "bx bx-heart"
+
+    etapi_create "noteHolidaySchedule" "sectHRAdmin" "Holiday Schedule 2024" "text" \
+        '<h2>ACME Corp Holiday Schedule — 2024</h2>
+<table><tr><th>Holiday</th><th>Date</th><th>Day</th></tr>
+<tr><td>New Year'\''s Day</td><td>January 1</td><td>Monday</td></tr>
+<tr><td>Martin Luther King Jr. Day</td><td>January 15</td><td>Monday</td></tr>
+<tr><td>Presidents'\'' Day</td><td>February 19</td><td>Monday</td></tr>
+<tr><td>Memorial Day</td><td>May 27</td><td>Monday</td></tr>
+<tr><td>Juneteenth</td><td>June 19</td><td>Wednesday</td></tr>
+<tr><td>Independence Day</td><td>July 4-5</td><td>Thursday-Friday</td></tr>
+<tr><td>Labor Day</td><td>September 2</td><td>Monday</td></tr>
+<tr><td>Thanksgiving</td><td>November 28-29</td><td>Thursday-Friday</td></tr>
+<tr><td>Christmas</td><td>December 24-25</td><td>Tuesday-Wednesday</td></tr></table>
+<p><strong>Floating Holidays:</strong> 2 days to use at your discretion.</p>' \
+        "text/html" 20
+
+    etapi_create "noteTeamDirectory" "sectHRAdmin" "Team Directory" "text" \
+        '<h2>Engineering Team Directory</h2>
+<table><tr><th>Name</th><th>Role</th><th>Email</th><th>Slack</th><th>Location</th></tr>
+<tr><td>Alice Chen</td><td>Senior Frontend Engineer</td><td>alice@acmecorp.com</td><td>@alice</td><td>San Francisco, CA</td></tr>
+<tr><td>Bob Martinez</td><td>Backend Lead</td><td>bob@acmecorp.com</td><td>@bob</td><td>Austin, TX</td></tr>
+<tr><td>Carol Wu</td><td>DevOps Engineer</td><td>carol@acmecorp.com</td><td>@carol</td><td>Seattle, WA</td></tr>
+<tr><td>Dave Kim</td><td>Mobile Developer</td><td>dave@acmecorp.com</td><td>@dave</td><td>New York, NY</td></tr>
+<tr><td>Eve Thompson</td><td>Engineering Manager</td><td>eve@acmecorp.com</td><td>@eve</td><td>London, UK</td></tr></table>
+<p><strong>On-call rotation:</strong> See PagerDuty schedule → <code>#oncall</code> Slack channel.</p>' \
+        "text/html" 30
+    etapi_add_label "noteTeamDirectory" "department" "engineering"
+    etapi_add_label "noteTeamDirectory" "visibility" "internal"
+
+    echo ""
+    echo "==> Seed complete."
+    echo "    Created ACME Corp knowledge base with 24+ notes across 6 sections."
+    echo "    - Getting Started (3 notes)"
+    echo "    - Project Planning (5 notes + 1 sub-book)"
+    echo "    - Meeting Notes (3 notes)"
+    echo "    - Technical Documentation (8 notes + 1 sub-book)"
+    echo "    - Engineering Standards (3 notes)"
+    echo "    - HR & Admin (3 notes)"
+}
+
+###############################################################################
+# cmd_verify — check that seeded notes are present and have expected content
+###############################################################################
+
+cmd_verify() {
+    echo "==> Verifying seed data..."
+    local errors=0
+
+    check_note_exists() {
+        local noteId="$1" label="$2"
+        local resp title
+        resp=$(curl -s "${API_BASE}/notes/${noteId}")
+        title=$(echo "$resp" | jq -r '.title // empty')
+        if [[ "$title" == "$label" ]]; then
+            echo "  ✓ ${noteId}: ${label}"
+        else
+            echo "  ✗ ${noteId}: expected '${label}' but got '${title}' (resp: ${resp})"
+            errors=$((errors + 1))
+        fi
+    }
+
+    check_note_content() {
+        local noteId="$1" searchPhrase="$2" label="$3"
+        local resp
+        resp=$(curl -s "${API_BASE}/notes/${noteId}/content")
+        if echo "$resp" | grep -qF "$searchPhrase"; then
+            echo "  ✓ ${noteId} content contains '${label}'"
+        else
+            echo "  ✗ ${noteId} content missing '${searchPhrase}'"
+            errors=$((errors + 1))
+        fi
+    }
+
+    check_search_result() {
+        local searchTerm="$1" expectedNoteId="$2" label="$3"
+        local resp results found
+        resp=$(curl -s "${API_BASE}/notes?search=${searchTerm}")
+        results=$(echo "$resp" | jq -r '.results')
+        found=$(echo "$results" | jq -r "map(.noteId) | join(\",\")")
+        if echo "$found" | grep -q "$expectedNoteId"; then
+            echo "  ✓ search '${searchTerm}' found ${expectedNoteId}"
+        else
+            echo "  ✗ search '${searchTerm}' did not find ${expectedNoteId} (found: ${found})"
+            errors=$((errors + 1))
+        fi
+    }
+
+    check_attribute() {
+        local noteId="$1" attrName="$2" attrValue="$3"
+        local resp attrId
+        resp=$(curl -s "${API_BASE}/notes/${noteId}")
+        local match
+        match=$(echo "$resp" | jq -r ".attributes[] | select(.name == \"${attrName}\" and .value == \"${attrValue}\") | .attributeId // empty")
+        if [[ -n "$match" ]]; then
+            echo "  ✓ ${noteId} has label ${attrName}=${attrValue}"
+        else
+            echo "  ✗ ${noteId} missing label ${attrName}=${attrValue}"
+            errors=$((errors + 1))
+        fi
+    }
+
+    # Root book exists
+    check_note_exists "acmeRoot" "ACME Corp Knowledge Base"
+
+    # Section books exist
+    check_note_exists "sectGettingStarted" "Getting Started"
+    check_note_exists "sectProjectPlanning" "Project Planning"
+    check_note_exists "sectMeetingNotes" "Meeting Notes"
+    check_note_exists "sectTechnicalDocs" "Technical Documentation"
+    check_note_exists "sectEngStandards" "Engineering Standards"
+    check_note_exists "sectHRAdmin" "HR & Admin"
+
+    # Key text notes with content checks
+    check_note_content "noteWelcome" "ACME Corporation" "Welcome text"
+    check_note_content "noteCodeOfConduct" "harassment-free" "Code of Conduct"
+    check_note_content "noteITOnboarding" "helpdesk@acmecorp.com" "IT Onboarding"
+    check_note_content "noteQ2Roadmap" "Dashboard v2" "Q2 Roadmap"
+    check_note_content "noteBudgetReview" "Budget Review" "Budget Review"
+    check_note_content "noteSprintPlanning" "Sprint Planning" "Sprint Planning"
+    check_note_content "noteAllHands" "Jane Smith" "All Hands"
+    check_note_content "noteCodeReview" "Code Review" "Code Review"
+    check_note_content "noteGitWorkflow" "trunk-based" "Git Workflow"
+    check_note_content "noteTeamDirectory" "Alice Chen" "Team Directory"
+
+    # Code notes
+    check_note_content "noteRollbackProc" "#!/bin/bash" "Rollback script"
+    check_note_content "noteAuthEndpoints" "POST /api/v1/auth/login" "Auth endpoints"
+    check_note_content "noteUserEndpoints" "GET /api/v1/users" "User endpoints"
+    check_note_content "noteDBSchema" "CREATE TABLE organizations" "DB schema"
+    check_note_content "noteDeployRunbook" "ECS service" "Deploy runbook"
+
+    # Hierarchy: check children of acmeRoot
+    local children
+    children=$(curl -s "${API_BASE}/notes/acmeRoot" | jq -r '.childNoteIds | join(",")')
+    for expected in sectGettingStarted sectProjectPlanning sectMeetingNotes sectTechnicalDocs sectEngStandards sectHRAdmin; do
+        if echo "$children" | grep -q "$expected"; then
+            echo "  ✓ acmeRoot child contains ${expected}"
+        else
+            echo "  ✗ acmeRoot missing child ${expected}"
+            errors=$((errors + 1))
+        fi
+    done
+
+    # Attributes
+    check_attribute "noteITOnboarding" "priority" "high"
+    check_attribute "noteITOnboarding" "department" "IT"
+    check_attribute "noteBudgetReview" "status" "reviewed"
+    check_attribute "noteQ2Retro" "type" "retrospective"
+    check_attribute "noteQ2Retro" "quarter" "Q2"
+    check_attribute "noteDeployRunbook" "environment" "production"
+
+    # Search for unique phrase
+    check_search_result "Q2%20Retrospective" "noteQ2Retro" "Q2 Retrospective search"
+
+    # Q2 Retrospective specific content
+    check_note_content "noteQ2Retro" "Q2 Retrospective" "Q2 Retro article"
+
+    echo ""
+    if [[ $errors -eq 0 ]]; then
+        echo "==> Verify: PASS — all checks passed."
+        return 0
+    else
+        echo "==> Verify: FAIL — ${errors} check(s) failed."
+        return 1
+    fi
+}
+
+###############################################################################
+# Existing commands: deploy, reset, stop, logs, status, help
+###############################################################################
+
+cmd_deploy() {
+    echo "==> Building Docker image from source (this may take several minutes)..."
+    docker build -f "${SCRIPT_DIR}/Dockerfile.tester-env" -t "${IMAGE_NAME}" "${SCRIPT_DIR}"
+
+    echo "==> Starting container on port ${PORT}..."
+    docker run -d --name "${CONTAINER_NAME}" \
+        -p "${PORT}:8080" \
+        -v "${DATA_VOLUME}:/home/node/trilium-data" \
+        -e TRILIUM_GENERAL_NOAUTHENTICATION=true \
+        "${IMAGE_NAME}"
+
+    echo "==> Waiting for server to start..."
+    for i in $(seq 1 30); do
+        if curl -s -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then
+            echo "==> Server responding."
+            break
+        fi
+        sleep 2
+    done
+
+    echo "==> Initializing database (no-auth mode)..."
+    curl -s -X POST "http://localhost:${PORT}/api/setup/new-document" || true
+
+    echo "==> Deployment complete. App running at http://localhost:${PORT}"
+    echo "    Credentials: none (TRILIUM_GENERAL_NOAUTHENTICATION=true)"
+    echo "    Data volume: ${DATA_VOLUME}"
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Volume: ${DATA_VOLUME}"
+        echo "Credentials: none (no-auth mode)"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Trilium - Tester Environment CLI
+
+Usage: ./tester-env <command> [--port <port>] [--run-id <id>]
+
+Commands:
+  deploy    Build Docker image from source, start container, initialize DB
+  seed      Populate with deterministic ACME Corp knowledge base (24+ notes)
+  verify    Assert that seed data is present and searchable
+  reset     Stop container, remove container and data volume
+  stop      Stop container (preserves data)
+  logs      Tail container logs
+  status    Show container status and URL
+  help      Show this help message
+
+Options:
+  --port <port>     Host port to bind to container port 8080.
+                    Default: 38080
+  --run-id <id>     Isolate container, image, and volume names for parallel runs.
+                    Default: default
+
+Seed data:
+  Creates an ACME Corp knowledge base with 6 sections and 24+ notes:
+    Getting Started · Project Planning · Meeting Notes
+    Technical Documentation · Engineering Standards · HR & Admin
+
+  Includes text notes, code notes with syntax highlighting,
+  labels/attributes, and a searchable marker phrase "Q2 Retrospective".
+
+Environment:
+  TRILIUM_GENERAL_NOAUTHENTICATION=true  (set automatically by deploy)
+  TRILIUM_DATA_DIR=/home/node/trilium-data
+
+Credentials: none — no-auth mode enabled, no login required.
+
+Typical workflow:
+  ./tester-env deploy    # Build from source, start container, init DB
+  ./tester-env seed      # Populate with deterministic seed data
+  ./tester-env verify    # Check seed data integrity
+  ./tester-env reset     # Clean slate
+
+Dockerfile: Dockerfile.tester-env (multi-stage, builds entire monorepo from source)
+Port: 8080 (container) → 38080 (host default)
+Data: /home/node/trilium-data (container) → named volume 'trilium-data'
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+
+    # Parse optional arguments
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --port)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    PORT="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --port requires a value"
+                    exit 1
+                fi
+                ;;
+            --run-id)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    RUN_ID="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --run-id requires a value"
+                    exit 1
+                fi
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: ${arg}"
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy)     cmd_deploy ;;
+        seed)       cmd_seed ;;
+        verify)     cmd_verify ;;
+        reset)      cmd_reset ;;
+        stop)       cmd_stop ;;
+        logs)       cmd_logs ;;
+        status)     cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
