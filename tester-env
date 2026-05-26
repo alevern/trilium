@@ -15,7 +15,9 @@ refresh_names() {
         suffix="-${RUN_ID}"
     fi
     CONTAINER_NAME="tester-env-trilium${suffix}"
-    IMAGE_NAME="tester-env-trilium${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-trilium:dev}"
     DATA_VOLUME="trilium-data${suffix}"
 }
 
