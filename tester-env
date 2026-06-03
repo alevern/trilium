@@ -19,6 +19,7 @@ refresh_names() {
     # (baseline, patch-set) combos share an image. Manual invocations get :dev.
     IMAGE_NAME="${IMAGE_TAG:-tester-env-trilium:dev}"
     DATA_VOLUME="trilium-data${suffix}"
+    API_BASE="http://localhost:${PORT}/etapi"
 }
 
 ###############################################################################
